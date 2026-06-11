@@ -1,0 +1,178 @@
+## 尾座式(Tailsitter)的机身坐标系建立
+
+### 1. 核心设计：机身坐标系 = MC（悬停）坐标系
+
+PX4 中，尾座式机型的**机身坐标系始终固定在 MC（多旋翼）坐标系**，即：
+- **Z 轴**：指向上方（推力方向，机身纵轴在悬停时方向）
+- **X 轴**：指向"前方"（悬停时的前方）
+- 飞控固件、EKF 估计出的姿态都是在此坐标系下表达的
+
+这一点可以从 [10042_sihsim_xvert](file:///home/elecl/PX4-Autopilot/ROMFS/px4fmu_common/init.d-posix/airframes/10042_sihsim_xvert#L50) 中的注释直接印证：
+```
+# IXX and IZZ are inverted from the thesis as the body frame is pitched by 90 deg
+```
+
+即由于 PX4 的 body frame 相对于论文中的 FW 坐标系有 90° pitch 旋转，惯量矩阵元素需要调换。
+
+---
+
+### 2. FW 模式下的坐标变换
+
+当尾座式进入固定翼模式（机头前飞）时，机身（MC 坐标系）相对于前飞方向**俯仰了 -90°**。FW 姿态控制器和速率控制器需要在内部做坐标变换才能正确工作。
+
+#### 2.1 姿态矩阵变换 — `FixedwingAttitudeControl.cpp`
+
+在 [FixedwingAttitudeControl.cpp#L221-L255](file:///home/elecl/PX4-Autopilot/src/modules/fw_att_control/FixedwingAttitudeControl.cpp#L221-L255)，代码注释说得很清楚：
+
+```
+原始旋转矩阵:         变换后:
+Rxx  Ryx  Rzx        -Rzx  Ryx  Rxx
+Rxy  Ryy  Rzy        -Rzy  Ryy  Rxy
+Rxz  Ryz  Rzz        -Rzz  Ryz  Rxz
+```
+
+具体操作：
+1. 将原 Z 列（MC 的推力方向）移到 X 列（FW 的前飞方向）
+2. 将原 X 列移到 Z 列
+3. 将新的 X 列取反（修正右手坐标系方向）
+
+**本质上是将机体绕 Y 轴旋转 -90°，使 FW 姿态控制器能在"前飞坐标系"下运行。**
+
+#### 2.2 角速率变换 — `FixedwingRateControl.cpp`
+
+在 [FixedwingRateControl.cpp#L246-L249](file:///home/elecl/PX4-Autopilot/src/modules/fw_rate_control/FixedwingRateControl.cpp#L246-L249)，实际角速率从 hover 坐标系旋转到 FW 坐标系：
+
+```cpp
+// Tailsitter: rotate setpoint from hover to fixed-wing frame
+rates = Vector3f(-angular_velocity.xyz[2], angular_velocity.xyz[1], angular_velocity.xyz[0]);
+```
+
+| 轴        | MC frame → FW frame  |
+| --------- | -------------------- |
+| roll (x)  | `-yaw_body`          |
+| pitch (y) | `pitch_body`（不变） |
+| yaw (z)   | `roll_body`          |
+
+#### 2.3 速率设定点变换 — `FixedwingRateControl.cpp`
+
+在 [FixedwingRateControl.cpp#L355-L357](file:///home/elecl/PX4-Autopilot/src/modules/fw_rate_control/FixedwingRateControl.cpp#L355-L357)，从 attitude controller 来的速率设定点也需要做同样变换：
+
+```cpp
+body_rates_setpoint = Vector3f(-_rates_sp.yaw, _rates_sp.pitch, _rates_sp.roll);
+```
+
+#### 2.4 扭矩输出逆变换 — `FixedwingRateControl.cpp`
+
+在 [FixedwingRateControl.cpp#L416-L420](file:///home/elecl/PX4-Autopilot/src/modules/fw_rate_control/FixedwingRateControl.cpp#L416-L420)，FW 控制器计算出的扭矩需要**逆变换回 body (hover) 坐标系**才能送给控制分配器：
+
+```cpp
+// Tailsitter: rotate back to body frame from airspeed frame
+const float helper = _vehicle_torque_setpoint.xyz[0];
+_vehicle_torque_setpoint.xyz[0] = _vehicle_torque_setpoint.xyz[2];
+_vehicle_torque_setpoint.xyz[2] = -helper;
+```
+
+**方向：** `torque_body.roll = torque_FW.yaw`, `torque_body.yaw = -torque_FW.roll`
+
+---
+
+### 3. 过渡(Transition)阶段的处理
+
+过渡阶段的核心代码在 [tailsitter.cpp](file:///home/elecl/PX4-Autopilot/src/modules/vtol_att_control/tailsitter.cpp)。
+
+#### 3.1 关键设计决策
+
+在过渡期间，**标准 FW 姿态/速率控制器不参与控制**。这是通过 `_in_fw_or_transition_wo_tailsitter_transition` 标志实现的（见 [FixedwingAttitudeControl.cpp#L267-L270](file:///home/elecl/PX4-Autopilot/src/modules/fw_att_control/FixedwingAttitudeControl.cpp#L267-L270)）：
+
+```cpp
+const bool is_in_transition_except_tailsitter = _vehicle_status.in_transition_mode
+        && !_vehicle_status.is_vtol_tailsitter;
+_in_fw_or_transition_wo_tailsitter_transition = is_fixed_wing || is_in_transition_except_tailsitter;
+```
+
+尾座式的过渡**完全由 `vtol_att_control` 模块中的 `Tailsitter` 类管理**，使用 MC 姿态控制器来驱动整个过渡过程。
+
+#### 3.2 前向过渡 (MC → FW): `TRANSITION_FRONT_P1`
+
+在 [tailsitter.cpp#L196-L199](file:///home/elecl/PX4-Autopilot/src/modules/vtol_att_control/tailsitter.cpp#L196-L199)：
+
+```cpp
+// 过渡起始目标姿态: 使用当前 MC 姿态设定点（水平机翼）
+_q_trans_start = Eulerf(0.0f, _mc_virtual_att_sp->pitch_body, _mc_virtual_att_sp->yaw_body);
+// 旋转轴: 当前机头方向 x 绕到垂直向下方向 (-z)
+Vector3f x = Dcmf(Quatf(_v_att->q)) * Vector3f(1, 0, 0);
+_trans_rot_axis = -x.cross(Vector3f(0, 0, -1));
+```
+
+然后在 [tailsitter.cpp#L221-L222](file:///home/elecl/PX4-Autopilot/src/modules/vtol_att_control/tailsitter.cpp#L221-L222)，按时间推进将起始姿态向 FW 方向旋转（前倾）：
+
+```cpp
+_q_trans_sp = Quatf(AxisAnglef(_trans_rot_axis,
+    _time_since_trans_start * trans_pitch_rate)) * _q_trans_start;
+```
+
+前向过渡完成条件（[tailsitter.cpp#L325-L345](file:///home/elecl/PX4-Autopilot/src/modules/vtol_att_control/tailsitter.cpp#L325-L345)）：
+- pitch 角达到 ≤ **-60°**（即 `PITCH_THRESHOLD_AUTO_TRANSITION_TO_FW = -1.05 rad`），或空速达标
+
+#### 3.3 后向过渡 (FW → MC): `TRANSITION_BACK`
+
+在 [tailsitter.cpp#L173-L193](file:///home/elecl/PX4-Autopilot/src/modules/vtol_att_control/tailsitter.cpp#L173-L193)：
+
+```cpp
+// 获取当前姿态的机头方向
+_q_trans_start = Quatf(_v_att->q);
+Vector3f z = -_q_trans_start.dcm_z();
+// 计算旋转轴（从当前机头方向旋转到向上）
+_trans_rot_axis = z.cross(Vector3f(0, 0, -1));
+
+// 过渡起始姿态: 在 FW 姿态设定点上构建，但要旋转到 MC 坐标系
+// 关键: 乘以 Quatf(Eulerf(0, -M_PI_2_F, 0)) 即绕 Y 轴旋转 -90°
+_q_trans_start = _q_trans_start * Quatf(Eulerf(0, -M_PI_2_F, 0));
+```
+
+然后在 [tailsitter.cpp#L231-L232](file:///home/elecl/PX4-Autopilot/src/modules/vtol_att_control/tailsitter.cpp#L231-L232)，将姿态逐步抬回：
+
+```cpp
+_q_trans_sp = Quatf(AxisAnglef(_trans_rot_axis,
+    _time_since_trans_start * trans_pitch_rate)) * _q_trans_start;
+```
+
+后向过渡完成条件：
+- pitch 角达到 ≥ **-15°**（即 `PITCH_THRESHOLD_AUTO_TRANSITION_TO_MC = -0.26 rad`），或超过最大过渡时间
+
+---
+
+### 4. 总结：坐标转换流程图
+
+```
+MC 模式:
+  机身坐标系 = EKF 估计坐标系（Z 轴朝上）
+      ↓
+  油门推力: thrust_body[2] → 控制分配器(矩阵0，MC通道)
+  扭矩: torque_body[x,y,z] → 控制分配器(矩阵0)
+
+过渡模式 (TRANSITION_FRONT / TRANSITION_BACK):
+  MC 姿态控制器完全接管
+      ↓
+  通过 _q_trans_sp 在起止姿态间插值旋转
+  最终输出到 _v_att_sp（仍在 MC 坐标系下）
+      ↓
+  推力: thrust_body[2] → 控制分配器(矩阵0，MC通道)
+  扭矩: torque_body[x,y,z] → 控制分配器(矩阵0)
+
+FW 模式:
+  机身坐标系（MC 坐标系）→ FW 控制器内部变换
+      ↓
+  FixedwingAttitudeControl: 旋转矩阵 swap(roll, yaw) + neg(pitch)
+  FixedwingRateControl: rates(roll=-yaw_body, yaw=roll_body)
+      ↓
+  FW 控制器在"前飞坐标系"下计算
+      ↓
+  扭矩输出逆变换: torque_body.roll = torque_FW.yaw, torque_body.yaw = -torque_FW.roll
+  推力: 通过 thrust_setpoint_0（MC通道）输出负的 FW 推力
+      ↓
+  控制分配器(矩阵0) 驱动电机（与 MC 模式共用同一套电机）
+  控制分配器(矩阵1) 驱动舵面（elevon等）
+```
+
+核心要点：**机身坐标系始终是 MC 坐标系，FW 控制器通过内部坐标变换来适配，过渡阶段由 VTOL 姿态控制模块直接驱动 MC 姿态控制器完成平滑旋转。**
